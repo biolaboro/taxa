@@ -76,7 +76,7 @@ def descendants(curs, taxon):
 
 def parse_args_to_url(args):
     keys = ("drivername", "username", "password", "host", "port", "database")
-    return URL(**{key: getattr(args, key) for key in keys})
+    return URL.create(**{key: getattr(args, key) for key in keys})
 
 
 def parse_dump(file):
