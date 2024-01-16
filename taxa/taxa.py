@@ -3,19 +3,21 @@
 import io
 import sys
 import tarfile
-from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, FileType
 from collections import deque
 from contextlib import contextmanager
+from csv import DictReader, DictWriter
 from functools import partial
 from getpass import getpass
 from itertools import chain
-from operator import itemgetter
 
-from sqlalchemy import create_engine
+import networkx as nx
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.engine.url import URL
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.sql import text
 
-from taxa.model import Base, TaxMerged, TaxName, TaxNode
+from .model import Base, TaxMerged, TaxName, TaxNode
 
 ROOT = 1
 
@@ -34,7 +36,8 @@ def session_scope(sessionmaker):
 
 
 def ancestors(curs, taxon):
-    sql = """
+    sql = text(
+        """
         SELECT tax_name.tax_id, tax_name.name_txt, tax_name.unique_name, tax_node.parent_tax_id, tax_node.rank
           FROM tax_name
           JOIN tax_node ON tax_node.tax_id = tax_name.tax_id
@@ -44,12 +47,12 @@ def ancestors(curs, taxon):
                 (SELECT new_tax_id FROM tax_merged WHERE old_tax_id = :tax_id), :tax_id
               )
           ;
-    """
+        """
+    )
 
     lineage = deque()
-
     while taxon != ROOT:
-        row = curs.execute(sql, params=dict(tax_id=taxon)).fetchone()
+        row = curs.execute(sql, params=dict(tax_id=taxon)).mappings().first()
         if row:
             lineage.appendleft(row)
             taxon = row["parent_tax_id"]
@@ -57,7 +60,7 @@ def ancestors(curs, taxon):
             break
 
     if lineage:
-        row = curs.execute(sql, params=dict(tax_id=ROOT)).fetchone()
+        row = curs.execute(sql, params=dict(tax_id=taxon)).mappings().first()
         lineage.appendleft(row)
 
     return lineage
@@ -65,8 +68,8 @@ def ancestors(curs, taxon):
 
 def descendants(curs, taxon):
     def _descendants(curs, taxon):
-        sql = "SELECT tax_id FROM tax_node WHERE parent_tax_id = :tax_id;"
-        rows = list(map(itemgetter(0), curs.execute(sql, params=dict(tax_id=taxon))))
+        stmt = select(TaxNode).where(TaxNode.parent_tax_id == taxon)
+        rows = [row[0].tax_id for row in curs.execute(stmt).all()]
         if rows:
             yield from rows
             yield from chain.from_iterable(map(partial(_descendants, curs), rows))
@@ -106,20 +109,79 @@ def main_create(engine, taxdump):
 
 def main_ancestors(engine, taxa, delimiter="\t"):
     with session_scope(sessionmaker(bind=engine)) as session:
-        print(
-            "taxon", "tax_id", "name_txt", "unique_name", "parent_tax_id", "rank",
-            sep=delimiter
-        )
-        for taxon in taxa:
-            for entry in ancestors(session, taxon):
-                print(taxon, *entry, sep=delimiter)
+        rows = (dict(taxon=taxon, **entry) for taxon in taxa for entry in ancestors(session, taxon))
+        row = next(rows)
+        writer = DictWriter(sys.stdout, fieldnames=row, delimiter=delimiter)
+        writer.writeheader()
+        writer.writerows((row, *rows))
 
 
 def main_descendants(engine, taxa):
-    for taxon in taxa:
-        with session_scope(sessionmaker(bind=engine)) as curs:
+    with session_scope(sessionmaker(bind=engine)) as curs:
+        for taxon in taxa:
             rows = descendants(curs, taxon)
             print(taxon, *rows, sep="\n")
+
+
+def main_custom(engine, file):
+    with file as file:
+        data = {row["key"]: row for row in DictReader(file, delimiter="\t")}
+
+    tax_map = {}
+    with session_scope(sessionmaker(bind=engine)) as session:
+        # get the next available identifiers
+        tax_id = session.execute(
+            text(
+                """
+                    SELECT MAX(tax_id)+1 FROM (
+                        SELECT MAX(tax_id) AS tax_id FROM tax_node UNION
+                        SELECT MAX(parent_tax_id) AS tax_id FROM tax_node
+                    );
+                """
+            )
+        ).scalar()
+        id = session.query(func.max(TaxName.id)).scalar() + 1
+        # load custom taxonomy as a directed graph
+        D = nx.DiGraph(((row["parent_tax_id"], row["key"]) for row in data.values()))
+        # for each directed graph
+        for nodes in nx.weakly_connected_components(D):
+            # find the root
+            root = next(node for node in nodes if D.in_degree(node) == 0)
+            # assert that the root exists in the database
+            count = session.execute(select(func.count(TaxNode.tax_id)).where(TaxNode.tax_id == root)).scalar()
+            assert count == 1
+            # calculate breadth first search traversal
+            T = nx.traversal.breadth_first_search.bfs_tree(D, root)
+            # assert the directed graph is a tree
+            assert nx.is_arborescence(T)
+            # for each edge, add the new node with attributes and track the assigned taxonomy identifiers
+            tax_map[root] = root
+            for edge in T.edges():
+                attr = data[edge[1]]
+                session.add(
+                    TaxNode(
+                        tax_id=tax_id,
+                        parent_tax_id=tax_map[edge[0]],
+                        rank=attr["rank"]
+                    )
+                )
+                session.add(
+                    TaxName(
+                        id=id,
+                        tax_id=tax_id,
+                        name_txt=attr["name_txt"],
+                        unique_name=attr["unique_name"],
+                        name_class=attr["name_class"]
+                    )
+                )
+                tax_map[edge[1]] = tax_id
+                tax_id += 1
+                id += 1
+
+    # report the new node taxonmy identifiers
+    for key, val in tax_map.items():
+        if key != val:
+            print(key, val, sep="\t")
 
 
 def conn_kwargs(args):
@@ -137,7 +199,7 @@ def add_db_args(parser):
 
 
 def parse_argv(argv):
-    parser = ArgumentParser(description="taxonomy tool",  formatter_class=ArgumentDefaultsHelpFormatter)
+    parser = ArgumentParser(description="taxonomy tool", formatter_class=ArgumentDefaultsHelpFormatter)
 
     add_db_args(parser)
 
@@ -169,12 +231,22 @@ def parse_argv(argv):
         "-mode",
         choices=choices,
         default=choices[0],
-        help="the delimiter for the resulting table"
+        help="the lineage mode"
     )
     subparser.add_argument(
         "-delimiter",
         default="\t",
         help="the delimiter for the resulting table"
+    )
+
+    subparser = subparsers.add_parser(
+        "custom",
+        help="this program inserts a custom taxonomy into the database"
+    )
+    subparser.add_argument(
+        "file",
+        help="the tsv file",
+        type=FileType()
     )
 
     args = parser.parse_args(argv)
@@ -198,6 +270,9 @@ def main(argv):
             main_ancestors(engine, args.taxa, delimiter=args.delimiter)
         elif args.mode == "descendants":
             main_descendants(engine, args.taxa)
+
+    elif args.command == "custom":
+        main_custom(engine, args.file)
 
     return 0
 
