@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from csv import DictReader, DictWriter
 from functools import partial
 from getpass import getpass
-from itertools import chain
+from itertools import chain, zip_longest
 
 import networkx as nx
 from sqlalchemy import create_engine, func, select
@@ -66,15 +66,21 @@ def ancestors(curs, taxon):
     return lineage
 
 
-def descendants(curs, taxon):
-    def _descendants(curs, taxon):
-        stmt = select(TaxNode).where(TaxNode.parent_tax_id == taxon)
-        rows = [row[0].tax_id for row in curs.execute(stmt).all()]
-        if rows:
-            yield from rows
-            yield from chain.from_iterable(map(partial(_descendants, curs), rows))
-
-    return list(_descendants(curs, taxon))
+def descendants(curs, taxon, parameter_limit=999):
+    taxa = [taxon]
+    while taxa:
+        taxa_result = []
+        # need to batch if parameter limit exceed and only do so if necessary
+        iterable = zip_longest(*[iter(taxa)] * parameter_limit) if len(taxa) > parameter_limit else [taxa]
+        for batch in iterable:
+            # query immediate descendants
+            stmt = select(TaxName, TaxNode).filter(TaxNode.parent_tax_id.in_(filter(None, batch))).join(TaxName, TaxNode.tax_id == TaxName.tax_id).filter(TaxName.name_class == "scientific name")
+            # these are descendants of the taxa
+            taxa_result_batch = [{key.name: getattr(ele, key.name) for ele in row for key in ele.columns} for row in curs.execute(stmt)]
+            yield from taxa_result_batch
+            taxa_result_batch = [row["tax_id"] for row in taxa_result_batch]
+            taxa_result += taxa_result_batch
+        taxa = taxa_result
 
 
 def parse_args_to_url(args):
@@ -107,20 +113,13 @@ def main_create(engine, taxdump):
                 session.bulk_insert_mappings(TaxName, mappings)
 
 
-def main_ancestors(engine, taxa, delimiter="\t"):
+def main_lineage(engine, taxa, func=ancestors, delimiter="\t"):
     with session_scope(sessionmaker(bind=engine)) as session:
-        rows = (dict(taxon=taxon, **entry) for taxon in taxa for entry in ancestors(session, taxon))
+        rows = (dict(taxon=taxon, **entry) for taxon in taxa for entry in func(session, taxon))
         row = next(rows)
         writer = DictWriter(sys.stdout, fieldnames=row, delimiter=delimiter)
         writer.writeheader()
         writer.writerows((row, *rows))
-
-
-def main_descendants(engine, taxa):
-    with session_scope(sessionmaker(bind=engine)) as curs:
-        for taxon in taxa:
-            rows = descendants(curs, taxon)
-            print(taxon, *rows, sep="\n")
 
 
 def main_custom(engine, file):
@@ -259,18 +258,13 @@ def parse_argv(argv):
 def main(argv):
     args = parse_argv(argv[1:])
 
-    dburl = parse_args_to_url(args)
-    engine = create_engine(dburl)
+    engine = create_engine(parse_args_to_url(args))
 
     if args.command == "create":
         main_create(engine, args.taxdump)
-
     elif args.command == "lineage":
-        if args.mode == "ancestors":
-            main_ancestors(engine, args.taxa, delimiter=args.delimiter)
-        elif args.mode == "descendants":
-            main_descendants(engine, args.taxa)
-
+        func = ancestors if args.mode == "ancestors" else descendants
+        main_lineage(engine, args.taxa, func, delimiter=args.delimiter)
     elif args.command == "custom":
         main_custom(engine, args.file)
 
